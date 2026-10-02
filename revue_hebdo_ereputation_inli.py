@@ -9,11 +9,31 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
+# Diagnostic Playwright : on distingue l'absence du module de l'absence de Chromium.
+PLAYWRIGHT_AVAILABLE = False
+PLAYWRIGHT_IMPORT_ERROR = ""
 try:
     from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
     PLAYWRIGHT_AVAILABLE = True
-except Exception:
-    PLAYWRIGHT_AVAILABLE = False
+except Exception as _playwright_exc:
+    PLAYWRIGHT_IMPORT_ERROR = str(_playwright_exc)
+
+def playwright_status():
+    """Retourne (etat, message) sans lancer de navigateur si possible."""
+    if not PLAYWRIGHT_AVAILABLE:
+        return ("missing_package", "Le module Python Playwright n'est pas installé dans l'environnement utilisé par Streamlit.")
+    try:
+        with sync_playwright() as p:
+            browser_type = p.chromium
+            executable = browser_type.executable_path
+            if not executable or not Path(executable).exists():
+                return ("missing_browser", f"Chromium Playwright est absent. Chemin attendu : {executable or 'non déterminé'}")
+        return ("ok", "Playwright et Chromium sont disponibles.")
+    except Exception as exc:
+        msg = str(exc)
+        if "Executable doesn't exist" in msg or "executable doesn't exist" in msg or "browserType.launch" in msg:
+            return ("missing_browser", "Playwright est installé mais le navigateur Chromium n'est pas installé.")
+        return ("error", f"Diagnostic Playwright : {msg}")
 
 PINK="#E82473"; TEAL="#269A87"; BRUNSWICK="#00594E"; AMARANTE="#B90745"; BORDEAUX="#9C0C35"; AMBER="#E3A21A"; RED="#D64550"
 AUDIT_PHASES=['Recherche et candidature', 'Visite et sélection', 'Signature et entrée', 'Vie quotidienne et SAV', 'Gestion financière et charges', 'Départ et restitution']
@@ -114,8 +134,13 @@ def _classify_google_review(rating, text):
 
 
 def scrape_google_reviews(max_reviews=100, headless=True, pause=1.1):
-    if not PLAYWRIGHT_AVAILABLE:
-        raise RuntimeError("Playwright n'est pas installé. Lancez : pip install playwright puis playwright install chromium")
+    status, message = playwright_status()
+    if status == "missing_package":
+        raise RuntimeError("PLAYWRIGHT_PACKAGE_MISSING")
+    if status == "missing_browser":
+        raise RuntimeError("PLAYWRIGHT_BROWSER_MISSING")
+    if status != "ok":
+        raise RuntimeError(message)
 
     reviews = []
     GOOGLE_PROFILE_DIR.mkdir(exist_ok=True)
@@ -326,15 +351,24 @@ with st.sidebar:
 
     should_collect = collect_google or (auto_google and not st.session_state.get('google_auto_done', False))
     if should_collect:
-        st.session_state.google_auto_done = True
-        if not PLAYWRIGHT_AVAILABLE:
-            st.error('Playwright est absent. Installez : pip install playwright puis playwright install chromium')
+        status, status_message = playwright_status()
+        if status == "missing_package":
+            st.error("🔴 Playwright n'est pas installé dans l'environnement Python utilisé par Streamlit.")
+            st.code("python3 -m pip install playwright", language="bash")
+            st.caption(f"Détail technique : {PLAYWRIGHT_IMPORT_ERROR}")
+        elif status == "missing_browser":
+            st.warning("🟠 Playwright est installé, mais Chromium n'est pas encore installé.")
+            st.code("python3 -m playwright install chromium", language="bash")
+            st.caption("Après l'installation, relancez Streamlit puis cliquez sur « Récupérer les nouveaux avis Google »." )
+        elif status != "ok":
+            st.error(f"🔴 {status_message}")
         else:
             with st.spinner('Connexion à Google Maps et récupération des avis…'):
                 try:
                     scraped = scrape_google_reviews(max_reviews=google_n, headless=not google_visible)
                     combined, new_only = merge_google_reviews(scraped)
                     st.session_state.google_history = combined
+                    st.session_state.google_auto_done = True
                     if not new_only.empty:
                         st.success(f'{len(new_only)} nouvel(aux) avis Google détecté(s).')
                         if 'review_id' in st.session_state.df.columns:
