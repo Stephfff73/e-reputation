@@ -5,7 +5,7 @@ V4.1 : collecte Google fiabilisée (Cloud : profil jetable, Chromium auto-instal
 Les 19 lignes de l'édition correspondent aux nouveaux verbatims qualifiés depuis le 08/04/2026.
 """
 from pathlib import Path
-import base64, html, os, re, shutil, subprocess, sys, tempfile, time
+import base64, html, os, re, shutil, subprocess, sys, tempfile, time, traceback
 from datetime import datetime
 import pandas as pd
 import streamlit as st
@@ -75,7 +75,7 @@ def image_b64(path):
 # Collecte automatique des avis Google Maps
 # -----------------------------------------------------------------------------
 GOOGLE_INLI_SEARCH_URL = "https://www.google.com/maps/search/?api=1&query=in%27li+5+Place+de+la+Pyramide+92800+Puteaux"
-GOOGLE_REVIEW_STORE = Path("avis_google_inli.csv")
+GOOGLE_REVIEW_STORE = BASE_DIR / "avis_google_inli.csv"
 GOOGLE_PROFILE_DIR = Path(".google_maps_profile_inli")
 
 
@@ -154,7 +154,7 @@ def _classify_google_review(rating, text):
     return phase, category, sentiment, urgency
 
 
-def scrape_google_reviews(max_reviews=100, headless=True, pause=1.1):
+def scrape_google_reviews(max_reviews=100, headless=True, pause=1.1, compat=False):
     status, message = playwright_status()
     if status == "missing_package":
         raise RuntimeError("PLAYWRIGHT_PACKAGE_MISSING")
@@ -164,31 +164,35 @@ def scrape_google_reviews(max_reviews=100, headless=True, pause=1.1):
         raise RuntimeError(message)
 
     reviews = []
+    crash = {"page": False}
+    browser = None
+    profile_dir = None
     if IS_CLOUD:
-        # Cloud : pas d'écran, profil jetable (pas de verrou ni de Chromium orphelin),
-        # options adaptées aux conteneurs (sandbox, /dev/shm minuscule).
+        # Cloud : pas d'écran, pas de profil persistant, options pour conteneur et
+        # WebGL désactivé (Google Maps passe alors en rendu léger, bien moins gourmand en mémoire).
         headless = True
-        profile_dir = tempfile.mkdtemp(prefix="gmaps_profile_")
         launch_args = [
             "--no-sandbox",
+            "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
             "--disable-gpu",
+            "--disable-3d-apis",
+            "--disable-software-rasterizer",
+            "--disable-extensions",
+            "--mute-audio",
             "--disable-blink-features=AutomationControlled",
         ]
+        if compat:
+            launch_args += ["--single-process", "--no-zygote"]
     else:
         GOOGLE_PROFILE_DIR.mkdir(exist_ok=True)
         profile_dir = str(GOOGLE_PROFILE_DIR)
         launch_args = ["--disable-blink-features=AutomationControlled"]
 
     with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            profile_dir,
-            headless=headless,
-            locale="fr-FR",
-            viewport={"width": 1280, "height": 900},
-            args=launch_args,
-        )
         if IS_CLOUD:
+            browser = p.chromium.launch(headless=True, args=launch_args)
+            context = browser.new_context(locale="fr-FR", viewport={"width": 1024, "height": 768})
             # Allège la mémoire : les avis sont du texte.
             context.route(
                 "**/*",
@@ -196,7 +200,16 @@ def scrape_google_reviews(max_reviews=100, headless=True, pause=1.1):
                 if route.request.resource_type in ("image", "media", "font")
                 else route.continue_(),
             )
+        else:
+            context = p.chromium.launch_persistent_context(
+                profile_dir,
+                headless=headless,
+                locale="fr-FR",
+                viewport={"width": 1280, "height": 900},
+                args=launch_args,
+            )
         page = context.pages[0] if context.pages else context.new_page()
+        page.on("crash", lambda *_: crash.__setitem__("page", True))
         try:
             page.goto(GOOGLE_INLI_SEARCH_URL, wait_until="domcontentloaded", timeout=90000)
             page.wait_for_timeout(3500)
@@ -352,10 +365,17 @@ def scrape_google_reviews(max_reviews=100, headless=True, pause=1.1):
                 )
         except PlaywrightError as exc:
             msg = str(exc).lower()
-            if "closed" in msg or "crash" in msg:
+            # Trace complète dans les journaux : Manage app > logs
+            print("[collecte Google] " + traceback.format_exc(), flush=True)
+            if "closed" in msg or "crash" in msg or crash["page"]:
+                frames = [f for f in traceback.extract_tb(exc.__traceback__)
+                          if Path(f.filename).name == Path(__file__).name]
+                where = (f"ligne {frames[-1].lineno} ({(frames[-1].line or '').strip()[:70]})") if frames else "inconnue"
+                cause = ("la page Chromium a planté (crash du rendu, presque toujours un manque de mémoire)"
+                         if crash["page"] else
+                         "le navigateur a été fermé de l'extérieur (processus tué par le serveur, ou profil verrouillé)")
                 raise RuntimeError(
-                    "Chromium s'est fermé en cours de collecte (mémoire insuffisante, ou profil verrouillé). "
-                    "Relancez l'app (Reboot), puis réduisez le nombre d'avis demandés."
+                    f"Chromium s'est arrêté : {cause}. Étape : {where}. Détail : {str(exc)[:160]}"
                 ) from exc
             raise
         finally:
@@ -363,8 +383,11 @@ def scrape_google_reviews(max_reviews=100, headless=True, pause=1.1):
                 context.close()
             except Exception:
                 pass
-            if IS_CLOUD:
-                shutil.rmtree(profile_dir, ignore_errors=True)
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
     return reviews[:max_reviews]
 
 
@@ -407,6 +430,11 @@ section[data-testid="stSidebar"]{background:linear-gradient(180deg,#00594E,#B907
 
 if 'df' not in st.session_state:
     st.session_state.df = df_demo()
+    # Avis Google déjà enregistrés (avis_google_inli.csv, versionné avec le script) :
+    # ils s'affichent même si la collecte en direct échoue.
+    _hist = load_google_history()
+    if not _hist.empty:
+        st.session_state.df = pd.concat([st.session_state.df, _hist], ignore_index=True)
 
 with st.sidebar:
     st.markdown('## 👂 La Voix des locataires')
@@ -415,7 +443,8 @@ with st.sidebar:
     st.markdown('### ⭐ Avis Google')
     google_n = st.slider('Nombre d’avis Google à rechercher', min_value=20, max_value=300, value=(40 if IS_CLOUD else 100), step=20)
     google_visible = st.checkbox('Afficher le navigateur pendant la collecte', value=False, disabled=IS_CLOUD, help='À utiliser surtout lors de la première connexion si Google affiche un écran de consentement. Indisponible sur le Cloud (pas d’écran).')
-    auto_google = st.checkbox('Collecte automatique au démarrage', value=True, help='Une collecte est exécutée une seule fois par session Streamlit. Un historique local permet ensuite de ne conserver que les nouveaux avis.')
+    compat = st.checkbox('Mode compatibilité Chromium (single-process)', value=False, disabled=not IS_CLOUD, help='À essayer sur le Cloud si Chromium s’arrête en cours de collecte.')
+    auto_google = st.checkbox('Collecte automatique au démarrage', value=(not IS_CLOUD), help='Une collecte est exécutée une seule fois par session Streamlit. Un historique local permet ensuite de ne conserver que les nouveaux avis.')
     collect_google = st.button('🔄 Récupérer les nouveaux avis Google', use_container_width=True)
 
     should_collect = collect_google or (auto_google and not st.session_state.get('google_auto_done', False))
@@ -446,7 +475,7 @@ with st.sidebar:
         else:
             with st.spinner('Connexion à Google Maps et récupération des avis…'):
                 try:
-                    scraped = scrape_google_reviews(max_reviews=google_n, headless=not google_visible)
+                    scraped = scrape_google_reviews(max_reviews=google_n, headless=not google_visible, compat=compat)
                     combined, new_only = merge_google_reviews(scraped)
                     st.session_state.google_history = combined
                     if not new_only.empty:
@@ -465,7 +494,7 @@ with st.sidebar:
                     st.error(f'Collecte Google impossible : {e}')
 
     if IS_CLOUD:
-        st.caption('Mode Cloud : navigateur sans interface, historique non conservé entre deux redémarrages.')
+        st.caption('Mode Cloud : navigateur sans interface. Les avis enregistrés dans avis_google_inli.csv (dépôt) sont chargés au démarrage ; les nouveaux ne survivent pas à un redémarrage.')
     if GOOGLE_REVIEW_STORE.exists():
         try:
             hist = load_google_history()
