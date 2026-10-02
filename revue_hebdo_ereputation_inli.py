@@ -1,27 +1,21 @@
 # -*- coding: utf-8 -*-
 """Revue hebdomadaire de l'écoute client in'li — V4
 Base : audit DPIEC mis à jour au 30/09/2026.
+V4.1 : collecte Google fiabilisée (Cloud : profil jetable, Chromium auto-installé, diagnostic).
 Les 19 lignes de l'édition correspondent aux nouveaux verbatims qualifiés depuis le 08/04/2026.
 """
 from pathlib import Path
-import base64, html, re, time
+import base64, html, os, re, shutil, subprocess, sys, tempfile, time
 from datetime import datetime
 import pandas as pd
 import streamlit as st
-import subprocess, sys
-
-@st.cache_resource
-def ensure_chromium():
-    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
-    return True
-
-ensure_chromium()
 
 # Diagnostic Playwright : on distingue l'absence du module de l'absence de Chromium.
 PLAYWRIGHT_AVAILABLE = False
 PLAYWRIGHT_IMPORT_ERROR = ""
+PlaywrightError = Exception   # remplacé par la vraie classe si Playwright est importable
 try:
-    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
     PLAYWRIGHT_AVAILABLE = True
 except Exception as _playwright_exc:
     PLAYWRIGHT_IMPORT_ERROR = str(_playwright_exc)
@@ -42,6 +36,25 @@ def playwright_status():
         if "Executable doesn't exist" in msg or "executable doesn't exist" in msg or "browserType.launch" in msg:
             return ("missing_browser", "Playwright est installé mais le navigateur Chromium n'est pas installé.")
         return ("error", f"Diagnostic Playwright : {msg}")
+
+# Détection de Streamlit Community Cloud (le code y est monté dans /mount/src).
+IS_CLOUD = Path("/mount/src").exists()
+BASE_DIR = Path(__file__).resolve().parent
+
+
+@st.cache_resource(show_spinner="Installation de Chromium (première exécution, 1 à 2 minutes)…")
+def ensure_chromium():
+    """Télécharge Chromium pour Playwright, une seule fois par déploiement.
+    Retourne (code_retour, journal)."""
+    try:
+        r = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            capture_output=True, text=True, timeout=900,
+        )
+        return r.returncode, (r.stdout + r.stderr)[-1200:]
+    except Exception as exc:
+        return 1, str(exc)
+
 
 PINK="#E82473"; TEAL="#269A87"; BRUNSWICK="#00594E"; AMARANTE="#B90745"; BORDEAUX="#9C0C35"; AMBER="#E3A21A"; RED="#D64550"
 AUDIT_PHASES=['Recherche et candidature', 'Visite et sélection', 'Signature et entrée', 'Vie quotidienne et SAV', 'Gestion financière et charges', 'Départ et restitution']
@@ -151,22 +164,47 @@ def scrape_google_reviews(max_reviews=100, headless=True, pause=1.1):
         raise RuntimeError(message)
 
     reviews = []
-    GOOGLE_PROFILE_DIR.mkdir(exist_ok=True)
+    if IS_CLOUD:
+        # Cloud : pas d'écran, profil jetable (pas de verrou ni de Chromium orphelin),
+        # options adaptées aux conteneurs (sandbox, /dev/shm minuscule).
+        headless = True
+        profile_dir = tempfile.mkdtemp(prefix="gmaps_profile_")
+        launch_args = [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-blink-features=AutomationControlled",
+        ]
+    else:
+        GOOGLE_PROFILE_DIR.mkdir(exist_ok=True)
+        profile_dir = str(GOOGLE_PROFILE_DIR)
+        launch_args = ["--disable-blink-features=AutomationControlled"]
+
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
-            str(GOOGLE_PROFILE_DIR),
+            profile_dir,
             headless=headless,
             locale="fr-FR",
-            viewport={"width": 1440, "height": 1000},
-            args=["--disable-blink-features=AutomationControlled"],
+            viewport={"width": 1280, "height": 900},
+            args=launch_args,
         )
+        if IS_CLOUD:
+            # Allège la mémoire : les avis sont du texte.
+            context.route(
+                "**/*",
+                lambda route: route.abort()
+                if route.request.resource_type in ("image", "media", "font")
+                else route.continue_(),
+            )
         page = context.pages[0] if context.pages else context.new_page()
         try:
             page.goto(GOOGLE_INLI_SEARCH_URL, wait_until="domcontentloaded", timeout=90000)
             page.wait_for_timeout(3500)
+            if "/sorry/" in page.url or "recaptcha" in page.url.lower():
+                raise RuntimeError("Google a affiché un contrôle anti-robot (captcha) : la collecte automatique est bloquée depuis ce serveur.")
 
             # Consentement Google si présent.
-            for label in ["Tout accepter", "Accepter tout", "Accept all"]:
+            for label in ["Tout accepter", "Accepter tout", "Accept all", "Tout refuser", "Reject all"]:
                 try:
                     btn = page.get_by_role("button", name=label, exact=True).first
                     if btn.count() and btn.is_visible(timeout=1000):
@@ -302,8 +340,31 @@ def scrape_google_reviews(max_reviews=100, headless=True, pause=1.1):
                 except Exception:
                     page.mouse.wheel(0, 2400)
                 page.wait_for_timeout(int(pause * 1000))
+
+            if not reviews:
+                try:
+                    titre = page.title()
+                except Exception:
+                    titre = "?"
+                raise RuntimeError(
+                    "Aucun avis lu. Page finale : " + page.url[:110] + " · titre : « " + titre[:60] + " ». "
+                    "Causes probables : écran de consentement ou captcha Google, ou structure de Google Maps modifiée."
+                )
+        except PlaywrightError as exc:
+            msg = str(exc).lower()
+            if "closed" in msg or "crash" in msg:
+                raise RuntimeError(
+                    "Chromium s'est fermé en cours de collecte (mémoire insuffisante, ou profil verrouillé). "
+                    "Relancez l'app (Reboot), puis réduisez le nombre d'avis demandés."
+                ) from exc
+            raise
         finally:
-            context.close()
+            try:
+                context.close()
+            except Exception:
+                pass
+            if IS_CLOUD:
+                shutil.rmtree(profile_dir, ignore_errors=True)
     return reviews[:max_reviews]
 
 
@@ -352,22 +413,34 @@ with st.sidebar:
     st.caption('V4 · Audit MAJ 30/09/2026 · Google automatisé')
 
     st.markdown('### ⭐ Avis Google')
-    google_n = st.slider('Nombre d’avis Google à rechercher', min_value=20, max_value=300, value=100, step=20)
-    google_visible = st.checkbox('Afficher le navigateur pendant la collecte', value=False, help='À utiliser surtout lors de la première connexion si Google affiche un écran de consentement.')
+    google_n = st.slider('Nombre d’avis Google à rechercher', min_value=20, max_value=300, value=(40 if IS_CLOUD else 100), step=20)
+    google_visible = st.checkbox('Afficher le navigateur pendant la collecte', value=False, disabled=IS_CLOUD, help='À utiliser surtout lors de la première connexion si Google affiche un écran de consentement. Indisponible sur le Cloud (pas d’écran).')
     auto_google = st.checkbox('Collecte automatique au démarrage', value=True, help='Une collecte est exécutée une seule fois par session Streamlit. Un historique local permet ensuite de ne conserver que les nouveaux avis.')
     collect_google = st.button('🔄 Récupérer les nouveaux avis Google', use_container_width=True)
 
     should_collect = collect_google or (auto_google and not st.session_state.get('google_auto_done', False))
     if should_collect:
+        # On marque la tentative AVANT de lancer la collecte : sinon chaque interaction
+        # (curseur, case à cocher…) relance le script et empile des Chromium orphelins.
+        st.session_state.google_auto_done = True
+
         status, status_message = playwright_status()
+        if status == "missing_browser":
+            code, log = ensure_chromium()
+            if code != 0:
+                ensure_chromium.clear()      # ne pas mémoriser un échec
+            status, status_message = playwright_status()
+            if status == "missing_browser":
+                st.warning("🟠 Chromium n'a pas pu être installé automatiquement.")
+                st.code(log or "aucun journal", language="bash")
+
         if status == "missing_package":
             st.error("🔴 Playwright n'est pas installé dans l'environnement Python utilisé par Streamlit.")
-            st.code("python3 -m pip install playwright", language="bash")
+            st.code("python3 -m pip install -r requirements.txt", language="bash")
             st.caption(f"Détail technique : {PLAYWRIGHT_IMPORT_ERROR}")
         elif status == "missing_browser":
-            st.warning("🟠 Playwright est installé, mais Chromium n'est pas encore installé.")
             st.code("python3 -m playwright install chromium", language="bash")
-            st.caption("Après l'installation, relancez Streamlit puis cliquez sur « Récupérer les nouveaux avis Google »." )
+            st.caption("Après l'installation, relancez Streamlit puis cliquez sur « Récupérer les nouveaux avis Google ».")
         elif status != "ok":
             st.error(f"🔴 {status_message}")
         else:
@@ -376,18 +449,23 @@ with st.sidebar:
                     scraped = scrape_google_reviews(max_reviews=google_n, headless=not google_visible)
                     combined, new_only = merge_google_reviews(scraped)
                     st.session_state.google_history = combined
-                    st.session_state.google_auto_done = True
                     if not new_only.empty:
                         st.success(f'{len(new_only)} nouvel(aux) avis Google détecté(s).')
-                        if 'review_id' in st.session_state.df.columns:
-                            st.session_state.df = pd.concat([st.session_state.df, new_only], ignore_index=True).drop_duplicates(subset=['source','review_id'], keep='last')
-                        else:
-                            st.session_state.df = pd.concat([st.session_state.df, new_only], ignore_index=True)
+                        base = st.session_state.df
+                        add = new_only
+                        # Dédoublonnage par review_id uniquement sur les avis Google
+                        # (drop_duplicates sur des NaN fusionnerait les verbatims Trustpilot).
+                        if 'review_id' in base.columns:
+                            deja = set(base['review_id'].dropna().astype(str))
+                            add = new_only[~new_only['review_id'].astype(str).isin(deja)]
+                        st.session_state.df = pd.concat([base, add], ignore_index=True)
                     else:
                         st.info(f'{len(scraped)} avis lus ; aucun nouvel avis depuis la dernière collecte.')
                 except Exception as e:
                     st.error(f'Collecte Google impossible : {e}')
 
+    if IS_CLOUD:
+        st.caption('Mode Cloud : navigateur sans interface, historique non conservé entre deux redémarrages.')
     if GOOGLE_REVIEW_STORE.exists():
         try:
             hist = load_google_history()
@@ -416,7 +494,12 @@ if phase!='Toutes': work=work[work.phase==phase]
 if urg: work=work[work.urgence.isin(urg)]
 if sent: work=work[work.sentiment.isin(sent)]
 
-img=image_b64('/mnt/data/visuel_header_inli_immobilier_satisfaction_v3.png')
+_VISUEL = 'visuel_header_inli_immobilier_satisfaction_v3.png'
+img=''
+for _p in (BASE_DIR / _VISUEL, BASE_DIR / 'assets' / _VISUEL, Path('/mnt/data') / _VISUEL):
+    img = image_b64(_p)
+    if img:
+        break
 hero_img=f"<img src='data:image/png;base64,{img}' alt='Architecture résidentielle et satisfaction locataire'>" if img else ''
 st.markdown(f"<div class='hero'><div class='hero-visual'>{hero_img}<img class='hero-logo' src='data:image/png;base64,{HEADER_LOGO_B64}' alt='in’li'></div><div class='hero-copy'><div style='font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;font-weight:800;color:#baf2e8'>in’li · écoute clients · revue hebdomadaire</div><h1>La Voix des locataires</h1><p style='margin:0;color:#e6f8f4'>Édition 2 · audit DPIEC mis à jour au 30 septembre 2026 · 19 nouveaux verbatims qualifiés</p></div></div>",unsafe_allow_html=True)
 
