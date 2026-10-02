@@ -8,6 +8,14 @@ import base64, html, re, time
 from datetime import datetime
 import pandas as pd
 import streamlit as st
+import subprocess, sys
+
+@st.cache_resource
+def ensure_chromium():
+    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
+    return True
+
+ensure_chromium()
 
 # Diagnostic Playwright : on distingue l'absence du module de l'absence de Chromium.
 PLAYWRIGHT_AVAILABLE = False
